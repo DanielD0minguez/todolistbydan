@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flujo de Tareas - Dual Timer</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <!-- Firebase SDKs -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // --- CONFIGURACIÓN Y ESTADO ---
+    const firebaseConfig = JSON.parse(__firebase_config);
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    const state = {
+      tasks: [],
+      selectedTaskId: null,
+      user: null,
+      lastRenderedTaskId: null
+    };
+
+    // --- UTILIDADES ---
+    const formatTime = (seconds) => {
+      const absSec = Math.max(0, Math.floor(seconds));
+      const m = Math.floor(absSec / 60).toString().padStart(2, '0');
+      const s = (absSec % 60).toString().padStart(2, '0');
+      const h = Math.floor(absSec / 3600).toString().padStart(2, '0');
+      return absSec >= 3600 ? `${h}:${m}:${s}` : `${m}:${s}`;
+    };
+
+    const escapeHtml = (unsafe) => (unsafe || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+
+    // --- AUDIO ALARMAS ---
+    const playAlarm = (type) => {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      
+      if (type === 'timer') {
+        // Alarma de temporizador: más aguda y rítmica
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(1200, ctx.currentTime);
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.3);
+      } else {
+        // Alarma de límite excedido: más suave
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.5);
+      }
+    };
+
+    // --- PERSISTENCIA (FIRESTORE) ---
+    const saveTasks = async () => {
+      if (!state.user) return;
+      const userRef = doc(db, 'artifacts', appId, 'users', state.user.uid, 'settings', 'data');
+      await setDoc(userRef, { tasks: state.tasks, lastSelected: state.selectedTaskId });
+    };
+
+    // --- COMPONENTES UI ---
+    const btnStr = (variant, content, onclick, extraClass = "", title = "") => {
+      const variants = {
+        primary: "bg-gradient-to-r from-violet-500 to-fuchsia-500 shadow-[0_5px_0_0_#4c1d95]",
+        success: "bg-gradient-to-r from-emerald-400 to-emerald-600 shadow-[0_5px_0_0_#047857]",
+        danger: "bg-gradient-to-r from-red-500 to-rose-600 shadow-[0_5px_0_0_#9f1239]",
+        warning: "bg-gradient-to-r from-amber-400 to-orange-500 shadow-[0_5px_0_0_#b45309]",
+        info: "bg-gradient-to-r from-blue-500 to-cyan-500 shadow-[0_5px_0_0_#1e3a8a]",
+        ghost: "bg-white/10 text-white shadow-[0_4px_0_0_rgba(255,255,255,0.1)] hover:bg-white/20"
+      };
+      return `<button onclick="${onclick}" title="${title}" class="${variants[variant]} text-white font-bold rounded-xl flex items-center justify-center transition-all duration-150 active:shadow-[0_0px_0_0_transparent] active:translate-y-[5px] disabled:opacity-50 disabled:cursor-not-allowed ${extraClass}">${content}</button>`;
+    };
+
+    // --- LOGICA DE RENDER ---
+    function renderSidebar() {
+      const container = document.getElementById('sidebar-tasks');
+      if (state.tasks.length === 0) {
+        container.innerHTML = '<p class="text-white/40 text-sm px-2">No hay tareas. Crea una nueva.</p>';
+        return;
+      }
+      container.innerHTML = state.tasks.map(task => {
+        const isSelected = state.selectedTaskId === task.id;
+        const activeClass = isSelected 
+          ? 'bg-gradient-to-r from-violet-500/40 to-fuchsia-500/40 border-fuchsia-400/50 shadow-[0_0_15px_rgba(192,38,211,0.3)] scale-[1.02]' 
+          : 'bg-black/20 border-white/5 hover:bg-white/10';
+        
+        const overLimit = task.estimatedTime > 0 && task.timeInvested > task.estimatedTime;
+
+        return `
+          <div onclick="window.selectTask('${task.id}')" class="p-4 rounded-2xl cursor-pointer transition-all duration-300 border flex items-center gap-3 ${activeClass} ${task.isCrossedOut ? 'opacity-60' : ''}">
+            <div class="shrink-0 ${overLimit ? 'text-rose-500 animate-pulse' : 'text-emerald-400'}">
+              ${task.isCrossedOut ? '<i data-lucide="check-circle-2"></i>' : (task.status === 'running' ? '<i data-lucide="play" class="animate-pulse"></i>' : '<i data-lucide="circle"></i>')}
+            </div>
+            <div class="flex-1 min-w-0">
+              <h3 id="side-name-${task.id}" class="font-bold text-sm truncate ${task.isCrossedOut ? 'line-through text-white/50' : 'text-white/90'}">
+                ${escapeHtml(task.name) || 'Sin título...'}
+              </h3>
+              <div class="text-xs ${overLimit ? 'text-rose-400 font-bold' : 'text-white/50'} flex items-center gap-1 mt-1">
+                <i data-lucide="clock" class="w-3 h-3"></i>
+                <span id="side-timer-${task.id}">${formatTime(task.timeInvested)}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+      lucide.createIcons();
+    }
+
+    function renderMain() {
+      const container = document.getElementById('main-content');
+      if (!state.selectedTaskId) {
+        state.lastRenderedTaskId = null;
+        container.innerHTML = `
+          <div class="text-center py-20 bg-white/5 backdrop-blur-lg border border-white/10 rounded-3xl border-dashed">
+            <div class="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-4 text-white/30"><i data-lucide="align-left" class="w-10 h-10"></i></div>
+            <h2 class="text-2xl font-bold text-white/50 mb-2">Selecciona una tarea</h2>
+            <p class="text-white/40">Haz clic en una tarea para ver detalles.</p>
+          </div>
+        `;
+        lucide.createIcons();
+        return;
+      }
+      const task = state.tasks.find(t => t.id === state.selectedTaskId);
+      if (!task) return;
+
+      const isRunning = task.status === 'running';
+      const isTimerRunning = task.timerStatus === 'running';
+      const animationClass = (state.selectedTaskId !== state.lastRenderedTaskId) ? 'animate-water' : '';
+      state.lastRenderedTaskId = state.selectedTaskId;
+
+      const overLimit = task.estimatedTime > 0 && task.timeInvested > task.estimatedTime;
+      const timerValue = task.remainingTime !== undefined ? task.remainingTime : task.estimatedTime;
+
+      container.innerHTML = `
+        <div id="task-card" class="${animationClass} relative p-6 mb-6 rounded-3xl border ${overLimit ? 'border-rose-500/50 bg-rose-500/5' : 'border-white/10 bg-white/5'} backdrop-blur-lg shadow-2xl transition-all duration-500">
+          
+          <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-5">
+            <div class="flex items-center gap-4 flex-1 w-full">
+              <button onclick="window.toggleCrossOut('${task.id}')" class="text-emerald-400 hover:text-emerald-300 transition-colors">
+                <i data-lucide="${task.isCrossedOut ? 'check-circle-2' : 'circle'}" class="w-8 h-8"></i>
+              </button>
+              <input type="text" value="${escapeHtml(task.name)}" oninput="window.handleNameInput('${task.id}', this.value)" class="flex-1 bg-transparent border-none outline-none text-2xl font-bold text-white placeholder-white/40 focus:ring-0 ${task.isCrossedOut ? 'line-through text-white/50' : ''}" placeholder="Nombre de la actividad..." />
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <button onclick="window.minimizeTask()" class="p-3 text-white/60 hover:text-white bg-white/5 hover:bg-white/20 border border-white/10 rounded-xl transition-all"><i data-lucide="minimize-2" class="w-5 h-5"></i></button>
+              ${btnStr('danger', '<i data-lucide="trash-2" class="w-5 h-5"></i>', `window.deleteTask('${task.id}')`, 'p-3')}
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="space-y-4">
+              <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                <div class="flex items-center gap-2 text-white/70 mb-3 font-medium text-sm"><i data-lucide="timer" class="w-4 h-4"></i><span>Configurar Tiempo Estimado</span></div>
+                <div class="flex flex-wrap gap-2">
+                  ${btnStr('ghost', '+1m', `window.addEstimate('${task.id}', 1)`, 'px-3 py-2 text-xs')}
+                  ${btnStr('ghost', '+5m', `window.addEstimate('${task.id}', 5)`, 'px-3 py-2 text-xs')}
+                  ${btnStr('ghost', '+25m', `window.addEstimate('${task.id}', 25)`, 'px-3 py-2 text-xs')}
+                  ${btnStr('danger', 'Reset', `window.resetEstimate('${task.id}')`, 'px-3 py-2 text-xs')}
+                </div>
+              </div>
+              <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                <div class="flex items-center gap-2 text-white/70 mb-2 font-medium text-sm"><i data-lucide="align-left" class="w-4 h-4"></i><span>Notas</span></div>
+                <textarea oninput="window.handleNotesInput('${task.id}', this.value)" class="w-full bg-transparent border-none outline-none text-white/90 placeholder-white/30 resize-none h-24 focus:ring-0 text-sm">${escapeHtml(task.notes)}</textarea>
+              </div>
+            </div>
+            
+            <div class="flex flex-col gap-4">
+              <!-- BLOQUE CRONÓMETRO (TIEMPO INVERTIDO) -->
+              <div class="flex flex-col items-center justify-center bg-black/30 rounded-2xl p-5 border border-white/10">
+                <div class="text-[10px] font-bold text-white/40 uppercase tracking-widest mb-1">Cronómetro (Invertido)</div>
+                <div id="main-timer" class="text-4xl font-black tabular-nums mb-3 ${overLimit ? 'text-rose-500 animate-pulse' : (isRunning ? 'text-cyan-400' : 'text-white')}">${formatTime(task.timeInvested)}</div>
+                
+                <div class="flex items-center gap-3">
+                  ${isRunning 
+                    ? btnStr('warning', '<i data-lucide="pause" class="w-5 h-5"></i>', `window.setStatus('${task.id}', 'paused')`, 'w-12 h-12 rounded-full')
+                    : btnStr('success', '<i data-lucide="play" class="w-5 h-5 ml-0.5"></i>', `window.setStatus('${task.id}', 'running')`, 'w-12 h-12 rounded-full')}
+                  ${btnStr('info', '<i data-lucide="rotate-ccw" class="w-5 h-5"></i>', `window.resetProgress('${task.id}')`, 'w-12 h-12 rounded-full')}
+                </div>
+              </div>
+
+              <!-- BLOQUE TEMPORIZADOR (CUENTA ATRÁS) -->
+              <div class="flex flex-col items-center justify-center bg-violet-500/10 rounded-2xl p-5 border border-violet-500/20">
+                <div class="text-[10px] font-bold text-violet-300/60 uppercase tracking-widest mb-1">Temporizador (Restante)</div>
+                <div class="text-3xl font-black tabular-nums mb-3 ${timerValue <= 0 ? 'text-rose-400' : (isTimerRunning ? 'text-fuchsia-400' : 'text-white/80')}">${formatTime(timerValue)}</div>
+                
+                <div class="flex items-center gap-2">
+                  ${isTimerRunning 
+                    ? btnStr('ghost', '<i data-lucide="pause" class="w-4 h-4 text-amber-400"></i>', `window.setTimerStatus('${task.id}', 'paused')`, 'w-9 h-9 rounded-lg')
+                    : btnStr('ghost', '<i data-lucide="play" class="w-4 h-4 text-emerald-400"></i>', `window.setTimerStatus('${task.id}', 'running')`, 'w-9 h-9 rounded-lg')}
+                  ${btnStr('ghost', '<i data-lucide="square" class="w-4 h-4 text-rose-400"></i>', `window.stopTimer('${task.id}')`, 'w-9 h-9 rounded-lg')}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      lucide.createIcons();
+    }
+
+    // --- ACCIONES EXPUESTAS ---
+    window.addTask = () => {
+      const newTask = { 
+        id: Date.now().toString(), name: '', 
+        estimatedTime: 0, timeInvested: 0, 
+        remainingTime: 0,
+        status: 'idle', timerStatus: 'idle',
+        isCrossedOut: false, notes: '', alerted: false, timerAlerted: false 
+      };
+      state.tasks.unshift(newTask);
+      state.selectedTaskId = newTask.id;
+      saveTasks();
+      renderApp();
+    };
+    
+    window.selectTask = (id) => { if(state.selectedTaskId !== id) { state.selectedTaskId = id; renderApp(); } };
+    
+    window.minimizeTask = () => {
+      const card = document.getElementById('task-card');
+      if (card) {
+        card.classList.add('animate-water-reverse');
+        setTimeout(() => { state.selectedTaskId = null; renderApp(); }, 500);
+      }
+    };
+
+    window.deleteTask = (id) => { state.tasks = state.tasks.filter(t => t.id !== id); if(state.selectedTaskId === id) state.selectedTaskId = null; saveTasks(); renderApp(); };
+    
+    // Controles Cronómetro
+    window.setStatus = (id, status) => { const t = state.tasks.find(x => x.id === id); if(t) t.status = status; saveTasks(); renderApp(); };
+    window.resetProgress = (id) => { const t = state.tasks.find(x => x.id === id); if(t) { t.status = 'idle'; t.timeInvested = 0; t.alerted = false; } saveTasks(); renderApp(); };
+
+    // Controles Temporizador
+    window.setTimerStatus = (id, status) => { 
+      const t = state.tasks.find(x => x.id === id); 
+      if(t) { 
+        if(t.remainingTime <= 0 && t.estimatedTime > 0) t.remainingTime = t.estimatedTime;
+        t.timerStatus = status; 
+      } 
+      saveTasks(); renderApp(); 
+    };
+    window.stopTimer = (id) => { 
+      const t = state.tasks.find(x => x.id === id); 
+      if(t) { t.timerStatus = 'idle'; t.remainingTime = t.estimatedTime; t.timerAlerted = false; } 
+      saveTasks(); renderApp(); 
+    };
+
+    window.toggleCrossOut = (id) => { const t = state.tasks.find(x => x.id === id); if(t) t.isCrossedOut = !t.isCrossedOut; saveTasks(); renderApp(); };
+    
+    window.addEstimate = (id, min) => { 
+      const t = state.tasks.find(x => x.id === id); 
+      if(t) { 
+        t.estimatedTime += min*60; 
+        t.remainingTime = (t.remainingTime || 0) + min*60;
+        t.alerted = false; 
+        t.timerAlerted = false;
+      } 
+      saveTasks(); renderApp(); 
+    };
+    
+    window.resetEstimate = (id) => { 
+      const t = state.tasks.find(x => x.id === id); 
+      if(t) { t.estimatedTime = 0; t.remainingTime = 0; t.alerted = false; t.timerAlerted = false; t.timerStatus = 'idle'; } 
+      saveTasks(); renderApp(); 
+    };
+
+    window.handleNameInput = (id, val) => { 
+      const t = state.tasks.find(x => x.id === id); 
+      if(t) { t.name = val; const s = document.getElementById(`side-name-${id}`); if(s) s.innerText = val || 'Sin título...'; saveTasks(); }
+    };
+    window.handleNotesInput = (id, val) => { const t = state.tasks.find(x => x.id === id); if(t) { t.notes = val; saveTasks(); } };
+
+    function renderApp() { renderSidebar(); renderMain(); }
+
+    // --- INICIALIZACIÓN ---
+    const init = async () => {
+      onAuthStateChanged(auth, async (user) => {
+        if (!user) {
+          await signInAnonymously(auth);
+        } else {
+          state.user = user;
+          const userRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'data');
+          onSnapshot(userRef, (docSnap) => {
+            if (docSnap.exists()) {
+              const data = docSnap.data();
+              state.tasks = data.tasks || [];
+              if (!state.selectedTaskId) state.selectedTaskId = data.lastSelected;
+              renderApp();
+            }
+          }, (err) => console.error("Error Firestore:", err));
+        }
+      });
+
+      // Bucle de tiempo principal
+      setInterval(() => {
+        let changed = false;
+        state.tasks.forEach(t => {
+          // Lógica Cronómetro
+          if (t.status === 'running') {
+            t.timeInvested++;
+            changed = true;
+            if (t.estimatedTime > 0 && t.timeInvested === t.estimatedTime && !t.alerted) {
+              t.alerted = true;
+              playAlarm('limit');
+            }
+          }
+          // Lógica Temporizador
+          if (t.timerStatus === 'running') {
+            if (t.remainingTime > 0) {
+              t.remainingTime--;
+              changed = true;
+              if (t.remainingTime === 0 && !t.timerAlerted) {
+                t.timerAlerted = true;
+                t.timerStatus = 'idle';
+                playAlarm('timer');
+              }
+            } else {
+              t.timerStatus = 'idle';
+              changed = true;
+            }
+          }
+        });
+        if (changed) {
+          renderSidebar();
+          if (state.selectedTaskId) renderMain();
+        }
+      }, 1000);
+      
+      document.getElementById('btn-add-task-container').innerHTML = btnStr('primary', '<i data-lucide="plus" class="w-6 h-6 mr-2"></i> Nueva Tarea', 'window.addTask()', 'px-6 py-4');
+    };
+
+    window.onload = init;
+  </script>
+
+  <style>
+    @keyframes slideDown { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-slide-down { animation: slideDown 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+    
+    @keyframes waterExpand {
+      0% { opacity: 0; transform: scale(0.2) translateX(-150px); border-radius: 50%; filter: blur(10px); }
+      100% { opacity: 1; transform: scale(1) translateX(0); border-radius: 1.5rem; filter: blur(0); }
+    }
+    .animate-water { animation: waterExpand 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; transform-origin: left center; }
+
+    @keyframes waterShrink {
+      0% { opacity: 1; transform: scale(1) translateX(0); border-radius: 1.5rem; }
+      100% { opacity: 0; transform: scale(0.2) translateX(-150px); border-radius: 50%; filter: blur(10px); }
+    }
+    .animate-water-reverse { animation: waterShrink 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; transform-origin: left center; }
+
+    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+  </style>
+</head>
+<body class="min-h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-purple-950 to-slate-900 font-sans p-4 sm:p-8 overflow-x-hidden text-white selection:bg-purple-500/30">
+
+  <div class="max-w-6xl mx-auto animate-slide-down flex flex-col h-full">
+    <header class="flex flex-col sm:flex-row items-center justify-between gap-6 mb-8 bg-white/5 backdrop-blur-xl border border-white/10 p-6 sm:p-8 rounded-3xl shadow-2xl">
+      <div>
+        <h1 class="text-4xl sm:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-violet-400 to-cyan-400 tracking-tighter mb-2">Flujo de Tareas</h1>
+        <p class="text-white/40 font-medium text-sm">Persistencia en la nube y alarmas duales.</p>
+      </div>
+      <div id="btn-add-task-container"></div>
+    </header>
+
+    <div class="flex flex-col lg:flex-row gap-8 items-start">
+      <aside class="w-full lg:w-1/3 bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-4 shadow-2xl max-h-[75vh] overflow-y-auto custom-scrollbar">
+        <h2 class="text-lg font-bold text-white/70 mb-4 px-2 flex items-center gap-2"><i data-lucide="layers" class="w-4 h-4"></i> Actividades</h2>
+        <div id="sidebar-tasks" class="space-y-3"></div>
+      </aside>
+      <main id="main-content" class="w-full lg:w-2/3"></main>
+    </div>
+  </div>
+</body>
+</html>
